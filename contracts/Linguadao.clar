@@ -6,6 +6,10 @@
 (define-constant ERR-ALREADY-VOTED (err u406))
 (define-constant ERR-INVALID-AMOUNT (err u407))
 (define-constant ERR-PROPOSAL-ACTIVE (err u408))
+(define-constant ERR-BOUNTY-EXPIRED (err u409))
+(define-constant ERR-BOUNTY-CLAIMED (err u410))
+(define-constant ERR-INVALID-DIFFICULTY (err u411))
+(define-constant ERR-SOLUTION-TOO-SHORT (err u412))
 
 (define-constant CONTRACT-OWNER tx-sender)
 (define-constant MIN-PROPOSAL-THRESHOLD u1000000)
@@ -16,6 +20,7 @@
 (define-data-var total-contributors uint u0)
 (define-data-var treasury-balance uint u0)
 (define-data-var proposal-counter uint u0)
+(define-data-var bounty-counter uint u0)
 
 (define-map languages
   { language-id: uint }
@@ -83,6 +88,46 @@
     completed: bool,
     completed-by: (optional principal),
     completion-date: (optional uint)
+  }
+)
+
+(define-map bounties
+  { bounty-id: uint }
+  {
+    title: (string-ascii 100),
+    description: (string-ascii 400),
+    challenge-text: (string-ascii 500),
+    creator: principal,
+    language-id: uint,
+    difficulty: uint,
+    reward-amount: uint,
+    expires-at: uint,
+    claimed: bool,
+    claimed-by: (optional principal),
+    claimed-at: (optional uint),
+    created-at: uint,
+    total-attempts: uint,
+    required-reputation: uint
+  }
+)
+
+(define-map bounty-attempts
+  { bounty-id: uint, attempt-id: uint }
+  {
+    submitter: principal,
+    solution-text: (string-ascii 1000),
+    submitted-at: uint,
+    verified: bool,
+    successful: bool
+  }
+)
+
+(define-map bounty-submissions
+  { bounty-id: uint, submitter: principal }
+  {
+    total-attempts: uint,
+    best-attempt: uint,
+    last-attempt-at: uint
   }
 )
 
@@ -332,6 +377,167 @@
   )
 )
 
+(define-public (create-bounty (title (string-ascii 100)) (description (string-ascii 400)) (challenge-text (string-ascii 500)) (language-id uint) (difficulty uint) (reward-amount uint) (duration uint) (required-reputation uint))
+  (let
+    (
+      (bounty-id (+ (var-get bounty-counter) u1))
+      (current-height stacks-block-height)
+      (contributor-data (unwrap! (map-get? contributors { contributor: tx-sender }) ERR-NOT-FOUND))
+      (language-exists (unwrap! (map-get? languages { language-id: language-id }) ERR-NOT-FOUND))
+    )
+    (asserts! (and (>= difficulty u1) (<= difficulty u5)) ERR-INVALID-DIFFICULTY)
+    (asserts! (> reward-amount u0) ERR-INVALID-AMOUNT)
+    (asserts! (>= (get reputation-score contributor-data) u75) ERR-NOT-AUTHORIZED)
+    (asserts! (>= (stx-get-balance tx-sender) reward-amount) ERR-INSUFFICIENT-FUNDS)
+    (try! (stx-transfer? reward-amount tx-sender (as-contract tx-sender)))
+    (map-set bounties
+      { bounty-id: bounty-id }
+      {
+        title: title,
+        description: description,
+        challenge-text: challenge-text,
+        creator: tx-sender,
+        language-id: language-id,
+        difficulty: difficulty,
+        reward-amount: reward-amount,
+        expires-at: (+ current-height duration),
+        claimed: false,
+        claimed-by: none,
+        claimed-at: none,
+        created-at: current-height,
+        total-attempts: u0,
+        required-reputation: required-reputation
+      }
+    )
+    (var-set bounty-counter bounty-id)
+    (var-set treasury-balance (+ (var-get treasury-balance) reward-amount))
+    (ok bounty-id)
+  )
+)
+
+(define-public (submit-bounty-solution (bounty-id uint) (solution-text (string-ascii 1000)))
+  (let
+    (
+      (bounty (unwrap! (map-get? bounties { bounty-id: bounty-id }) ERR-NOT-FOUND))
+      (contributor-data (unwrap! (map-get? contributors { contributor: tx-sender }) ERR-NOT-FOUND))
+      (current-height stacks-block-height)
+      (existing-submission (default-to 
+        { total-attempts: u0, best-attempt: u0, last-attempt-at: u0 }
+        (map-get? bounty-submissions { bounty-id: bounty-id, submitter: tx-sender })
+      ))
+      (attempt-id (+ (get total-attempts existing-submission) u1))
+    )
+    (asserts! (< current-height (get expires-at bounty)) ERR-BOUNTY-EXPIRED)
+    (asserts! (not (get claimed bounty)) ERR-BOUNTY-CLAIMED)
+    (asserts! (>= (get reputation-score contributor-data) (get required-reputation bounty)) ERR-NOT-AUTHORIZED)
+    (asserts! (>= (len solution-text) u20) ERR-SOLUTION-TOO-SHORT)
+    (map-set bounty-attempts
+      { bounty-id: bounty-id, attempt-id: attempt-id }
+      {
+        submitter: tx-sender,
+        solution-text: solution-text,
+        submitted-at: current-height,
+        verified: false,
+        successful: false
+      }
+    )
+    (map-set bounty-submissions
+      { bounty-id: bounty-id, submitter: tx-sender }
+      {
+        total-attempts: attempt-id,
+        best-attempt: attempt-id,
+        last-attempt-at: current-height
+      }
+    )
+    (map-set bounties
+      { bounty-id: bounty-id }
+      (merge bounty { total-attempts: (+ (get total-attempts bounty) u1) })
+    )
+    (ok attempt-id)
+  )
+)
+
+(define-public (verify-bounty-solution (bounty-id uint) (attempt-id uint) (successful bool))
+  (let
+    (
+      (bounty (unwrap! (map-get? bounties { bounty-id: bounty-id }) ERR-NOT-FOUND))
+      (attempt (unwrap! (map-get? bounty-attempts { bounty-id: bounty-id, attempt-id: attempt-id }) ERR-NOT-FOUND))
+      (submitter (get submitter attempt))
+      (contributor-data (unwrap! (map-get? contributors { contributor: submitter }) ERR-NOT-FOUND))
+      (current-height stacks-block-height)
+      (reward-amount (get reward-amount bounty))
+      (reputation-bonus (* (get difficulty bounty) u5))
+    )
+    (asserts! (or (is-eq tx-sender CONTRACT-OWNER) (is-eq tx-sender (get creator bounty))) ERR-NOT-AUTHORIZED)
+    (asserts! (not (get verified attempt)) ERR-ALREADY-EXISTS)
+    (asserts! (not (get claimed bounty)) ERR-BOUNTY-CLAIMED)
+    (map-set bounty-attempts
+      { bounty-id: bounty-id, attempt-id: attempt-id }
+      (merge attempt { verified: true, successful: successful })
+    )
+    (if successful
+      (begin
+        (try! (as-contract (stx-transfer? reward-amount tx-sender submitter)))
+        (map-set bounties
+          { bounty-id: bounty-id }
+          (merge bounty { 
+            claimed: true,
+            claimed-by: (some submitter),
+            claimed-at: (some current-height)
+          })
+        )
+        (map-set contributors
+          { contributor: submitter }
+          (merge contributor-data { 
+            total-rewards: (+ (get total-rewards contributor-data) reward-amount),
+            reputation-score: (+ (get reputation-score contributor-data) reputation-bonus)
+          })
+        )
+        (var-set treasury-balance (- (var-get treasury-balance) reward-amount))
+      )
+      true
+    )
+    (ok successful)
+  )
+)
+
+(define-public (extend-bounty-deadline (bounty-id uint) (additional-duration uint))
+  (let
+    (
+      (bounty (unwrap! (map-get? bounties { bounty-id: bounty-id }) ERR-NOT-FOUND))
+      (current-height stacks-block-height)
+    )
+    (asserts! (is-eq tx-sender (get creator bounty)) ERR-NOT-AUTHORIZED)
+    (asserts! (not (get claimed bounty)) ERR-BOUNTY-CLAIMED)
+    (asserts! (< current-height (get expires-at bounty)) ERR-BOUNTY-EXPIRED)
+    (map-set bounties
+      { bounty-id: bounty-id }
+      (merge bounty { expires-at: (+ (get expires-at bounty) additional-duration) })
+    )
+    (ok true)
+  )
+)
+
+(define-public (cancel-bounty (bounty-id uint))
+  (let
+    (
+      (bounty (unwrap! (map-get? bounties { bounty-id: bounty-id }) ERR-NOT-FOUND))
+      (current-height stacks-block-height)
+      (refund-amount (get reward-amount bounty))
+    )
+    (asserts! (is-eq tx-sender (get creator bounty)) ERR-NOT-AUTHORIZED)
+    (asserts! (not (get claimed bounty)) ERR-BOUNTY-CLAIMED)
+    (asserts! (is-eq (get total-attempts bounty) u0) ERR-PROPOSAL-ACTIVE)
+    (try! (as-contract (stx-transfer? refund-amount tx-sender (get creator bounty))))
+    (map-set bounties
+      { bounty-id: bounty-id }
+      (merge bounty { claimed: true, claimed-at: (some current-height) })
+    )
+    (var-set treasury-balance (- (var-get treasury-balance) refund-amount))
+    (ok refund-amount)
+  )
+)
+
 (define-read-only (get-language (language-id uint))
   (map-get? languages { language-id: language-id })
 )
@@ -362,4 +568,20 @@
 
 (define-read-only (get-total-contributors)
   (var-get total-contributors)
+)
+
+(define-read-only (get-bounty (bounty-id uint))
+  (map-get? bounties { bounty-id: bounty-id })
+)
+
+(define-read-only (get-bounty-attempt (bounty-id uint) (attempt-id uint))
+  (map-get? bounty-attempts { bounty-id: bounty-id, attempt-id: attempt-id })
+)
+
+(define-read-only (get-bounty-submission (bounty-id uint) (submitter principal))
+  (map-get? bounty-submissions { bounty-id: bounty-id, submitter: submitter })
+)
+
+(define-read-only (get-total-bounties)
+  (var-get bounty-counter)
 )
