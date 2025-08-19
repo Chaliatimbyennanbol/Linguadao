@@ -10,6 +10,11 @@
 (define-constant ERR-BOUNTY-CLAIMED (err u410))
 (define-constant ERR-INVALID-DIFFICULTY (err u411))
 (define-constant ERR-SOLUTION-TOO-SHORT (err u412))
+(define-constant ERR-SESSION-NOT-AVAILABLE (err u413))
+(define-constant ERR-SESSION-COMPLETED (err u414))
+(define-constant ERR-INVALID-RATING (err u415))
+(define-constant ERR-SESSION-ACTIVE (err u416))
+(define-constant ERR-INSUFFICIENT-REPUTATION (err u417))
 
 (define-constant CONTRACT-OWNER tx-sender)
 (define-constant MIN-PROPOSAL-THRESHOLD u1000000)
@@ -21,6 +26,7 @@
 (define-data-var treasury-balance uint u0)
 (define-data-var proposal-counter uint u0)
 (define-data-var bounty-counter uint u0)
+(define-data-var session-counter uint u0)
 
 (define-map languages
   { language-id: uint }
@@ -128,6 +134,54 @@
     total-attempts: uint,
     best-attempt: uint,
     last-attempt-at: uint
+  }
+)
+
+(define-map tutoring-profiles
+  { tutor: principal }
+  {
+    bio: (string-ascii 300),
+    hourly-rate: uint,
+    languages-taught: (list 10 uint),
+    availability-status: (string-ascii 20),
+    total-sessions: uint,
+    average-rating: uint,
+    total-rating-points: uint,
+    rating-count: uint,
+    joined-tutoring-at: uint,
+    expertise-level: (string-ascii 20)
+  }
+)
+
+(define-map tutoring-sessions
+  { session-id: uint }
+  {
+    tutor: principal,
+    student: principal,
+    language-id: uint,
+    session-type: (string-ascii 30),
+    duration-minutes: uint,
+    hourly-rate: uint,
+    total-cost: uint,
+    scheduled-at: uint,
+    status: (string-ascii 20),
+    created-at: uint,
+    completed-at: (optional uint),
+    student-rating: (optional uint),
+    tutor-rating: (optional uint),
+    session-notes: (string-ascii 500)
+  }
+)
+
+(define-map session-payments
+  { session-id: uint }
+  {
+    amount-escrowed: uint,
+    platform-fee: uint,
+    tutor-payout: uint,
+    payment-released: bool,
+    escrowed-at: uint,
+    released-at: (optional uint)
   }
 )
 
@@ -585,3 +639,247 @@
 (define-read-only (get-total-bounties)
   (var-get bounty-counter)
 )
+
+(define-public (create-tutoring-profile (bio (string-ascii 300)) (hourly-rate uint) (languages-taught (list 10 uint)) (expertise-level (string-ascii 20)))
+  (let
+    (
+      (contributor-data (unwrap! (map-get? contributors { contributor: tx-sender }) ERR-NOT-FOUND))
+      (current-height stacks-block-height)
+      (existing-profile (map-get? tutoring-profiles { tutor: tx-sender }))
+    )
+    (asserts! (is-none existing-profile) ERR-ALREADY-EXISTS)
+    (asserts! (>= (get reputation-score contributor-data) u150) ERR-INSUFFICIENT-REPUTATION)
+    (asserts! (> hourly-rate u0) ERR-INVALID-AMOUNT)
+    (asserts! (get active contributor-data) ERR-NOT-AUTHORIZED)
+    (map-set tutoring-profiles
+      { tutor: tx-sender }
+      {
+        bio: bio,
+        hourly-rate: hourly-rate,
+        languages-taught: languages-taught,
+        availability-status: "available",
+        total-sessions: u0,
+        average-rating: u0,
+        total-rating-points: u0,
+        rating-count: u0,
+        joined-tutoring-at: current-height,
+        expertise-level: expertise-level
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-public (update-tutoring-profile (bio (string-ascii 300)) (hourly-rate uint) (availability-status (string-ascii 20)) (expertise-level (string-ascii 20)))
+  (let
+    (
+      (existing-profile (unwrap! (map-get? tutoring-profiles { tutor: tx-sender }) ERR-NOT-FOUND))
+    )
+    (asserts! (> hourly-rate u0) ERR-INVALID-AMOUNT)
+    (map-set tutoring-profiles
+      { tutor: tx-sender }
+      (merge existing-profile {
+        bio: bio,
+        hourly-rate: hourly-rate,
+        availability-status: availability-status,
+        expertise-level: expertise-level
+      })
+    )
+    (ok true)
+  )
+)
+
+(define-public (request-tutoring-session (tutor principal) (language-id uint) (session-type (string-ascii 30)) (duration-minutes uint) (scheduled-at uint))
+  (let
+    (
+      (session-id (+ (var-get session-counter) u1))
+      (tutor-profile (unwrap! (map-get? tutoring-profiles { tutor: tutor }) ERR-NOT-FOUND))
+      (student-data (unwrap! (map-get? contributors { contributor: tx-sender }) ERR-NOT-FOUND))
+      (language-exists (unwrap! (map-get? languages { language-id: language-id }) ERR-NOT-FOUND))
+      (current-height stacks-block-height)
+      (hourly-rate (get hourly-rate tutor-profile))
+      (total-cost (/ (* hourly-rate duration-minutes) u60))
+      (platform-fee (/ total-cost u20))
+      (tutor-payout (- total-cost platform-fee))
+    )
+    (asserts! (is-eq (get availability-status tutor-profile) "available") ERR-SESSION-NOT-AVAILABLE)
+    (asserts! (get active student-data) ERR-NOT-AUTHORIZED)
+    (asserts! (> duration-minutes u0) ERR-INVALID-AMOUNT)
+    (asserts! (>= (stx-get-balance tx-sender) total-cost) ERR-INSUFFICIENT-FUNDS)
+    (try! (stx-transfer? total-cost tx-sender (as-contract tx-sender)))
+    (map-set tutoring-sessions
+      { session-id: session-id }
+      {
+        tutor: tutor,
+        student: tx-sender,
+        language-id: language-id,
+        session-type: session-type,
+        duration-minutes: duration-minutes,
+        hourly-rate: hourly-rate,
+        total-cost: total-cost,
+        scheduled-at: scheduled-at,
+        status: "scheduled",
+        created-at: current-height,
+        completed-at: none,
+        student-rating: none,
+        tutor-rating: none,
+        session-notes: ""
+      }
+    )
+    (map-set session-payments
+      { session-id: session-id }
+      {
+        amount-escrowed: total-cost,
+        platform-fee: platform-fee,
+        tutor-payout: tutor-payout,
+        payment-released: false,
+        escrowed-at: current-height,
+        released-at: none
+      }
+    )
+    (var-set session-counter session-id)
+    (var-set treasury-balance (+ (var-get treasury-balance) platform-fee))
+    (ok session-id)
+  )
+)
+
+(define-public (complete-tutoring-session (session-id uint) (session-notes (string-ascii 500)))
+  (let
+    (
+      (session (unwrap! (map-get? tutoring-sessions { session-id: session-id }) ERR-NOT-FOUND))
+      (current-height stacks-block-height)
+    )
+    (asserts! (is-eq tx-sender (get tutor session)) ERR-NOT-AUTHORIZED)
+    (asserts! (is-eq (get status session) "scheduled") ERR-SESSION-COMPLETED)
+    (map-set tutoring-sessions
+      { session-id: session-id }
+      (merge session {
+        status: "completed",
+        completed-at: (some current-height),
+        session-notes: session-notes
+      })
+    )
+    (ok true)
+  )
+)
+
+(define-public (rate-tutoring-session (session-id uint) (rating uint) (is-student bool))
+  (let
+    (
+      (session (unwrap! (map-get? tutoring-sessions { session-id: session-id }) ERR-NOT-FOUND))
+      (tutor-profile (unwrap! (map-get? tutoring-profiles { tutor: (get tutor session) }) ERR-NOT-FOUND))
+      (current-height stacks-block-height)
+    )
+    (asserts! (and (>= rating u1) (<= rating u5)) ERR-INVALID-RATING)
+    (asserts! (is-eq (get status session) "completed") ERR-SESSION-ACTIVE)
+    (if is-student
+      (begin
+        (asserts! (is-eq tx-sender (get student session)) ERR-NOT-AUTHORIZED)
+        (asserts! (is-none (get student-rating session)) ERR-ALREADY-EXISTS)
+        (map-set tutoring-sessions
+          { session-id: session-id }
+          (merge session { student-rating: (some rating) })
+        )
+        (map-set tutoring-profiles
+          { tutor: (get tutor session) }
+          (merge tutor-profile {
+            total-rating-points: (+ (get total-rating-points tutor-profile) rating),
+            rating-count: (+ (get rating-count tutor-profile) u1),
+            average-rating: (/ (+ (get total-rating-points tutor-profile) rating) (+ (get rating-count tutor-profile) u1))
+          })
+        )
+      )
+      (begin
+        (asserts! (is-eq tx-sender (get tutor session)) ERR-NOT-AUTHORIZED)
+        (asserts! (is-none (get tutor-rating session)) ERR-ALREADY-EXISTS)
+        (map-set tutoring-sessions
+          { session-id: session-id }
+          (merge session { tutor-rating: (some rating) })
+        )
+      )
+    )
+    (ok true)
+  )
+)
+
+(define-public (release-session-payment (session-id uint))
+  (let
+    (
+      (session (unwrap! (map-get? tutoring-sessions { session-id: session-id }) ERR-NOT-FOUND))
+      (payment (unwrap! (map-get? session-payments { session-id: session-id }) ERR-NOT-FOUND))
+      (tutor-profile (unwrap! (map-get? tutoring-profiles { tutor: (get tutor session) }) ERR-NOT-FOUND))
+      (current-height stacks-block-height)
+      (tutor-payout (get tutor-payout payment))
+    )
+    (asserts! (is-eq (get status session) "completed") ERR-SESSION-ACTIVE)
+    (asserts! (not (get payment-released payment)) ERR-ALREADY-EXISTS)
+    (asserts! (or 
+      (is-some (get student-rating session))
+      (> (- current-height (unwrap! (get completed-at session) ERR-SESSION-ACTIVE)) u144)
+    ) ERR-SESSION-ACTIVE)
+    (try! (as-contract (stx-transfer? tutor-payout tx-sender (get tutor session))))
+    (map-set session-payments
+      { session-id: session-id }
+      (merge payment {
+        payment-released: true,
+        released-at: (some current-height)
+      })
+    )
+    (map-set tutoring-profiles
+      { tutor: (get tutor session) }
+      (merge tutor-profile {
+        total-sessions: (+ (get total-sessions tutor-profile) u1)
+      })
+    )
+    (ok tutor-payout)
+  )
+)
+
+(define-public (cancel-tutoring-session (session-id uint))
+  (let
+    (
+      (session (unwrap! (map-get? tutoring-sessions { session-id: session-id }) ERR-NOT-FOUND))
+      (payment (unwrap! (map-get? session-payments { session-id: session-id }) ERR-NOT-FOUND))
+      (current-height stacks-block-height)
+      (refund-amount (get amount-escrowed payment))
+      (platform-fee (get platform-fee payment))
+    )
+    (asserts! (or 
+      (is-eq tx-sender (get student session)) 
+      (is-eq tx-sender (get tutor session))
+    ) ERR-NOT-AUTHORIZED)
+    (asserts! (is-eq (get status session) "scheduled") ERR-SESSION-COMPLETED)
+    (asserts! (not (get payment-released payment)) ERR-ALREADY-EXISTS)
+    (try! (as-contract (stx-transfer? (- refund-amount platform-fee) tx-sender (get student session))))
+    (map-set tutoring-sessions
+      { session-id: session-id }
+      (merge session { status: "cancelled" })
+    )
+    (map-set session-payments
+      { session-id: session-id }
+      (merge payment {
+        payment-released: true,
+        released-at: (some current-height)
+      })
+    )
+    (ok (- refund-amount platform-fee))
+  )
+)
+
+(define-read-only (get-tutoring-profile (tutor principal))
+  (map-get? tutoring-profiles { tutor: tutor })
+)
+
+(define-read-only (get-tutoring-session (session-id uint))
+  (map-get? tutoring-sessions { session-id: session-id })
+)
+
+(define-read-only (get-session-payment (session-id uint))
+  (map-get? session-payments { session-id: session-id })
+)
+
+(define-read-only (get-total-sessions)
+  (var-get session-counter)
+)
+
+
